@@ -1,0 +1,367 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
+<meta name="theme-color" content="#000000">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
+<link rel="manifest" href="manifest.json">
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<title>Blood Tracker</title>
+<style>
+  :root {
+    --hit: #00e5ff;          /* default highlight: cyan, safe for red-green CVD */
+    --ui-bg: rgba(0,0,0,.72);
+    --ui-fg: #ffffff;
+    --accent: #ffd400;       /* yellow, also CVD-safe */
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { margin: 0; height: 100%; background: #000; color: var(--ui-fg);
+    font: 16px/1.3 system-ui, -apple-system, Segoe UI, Roboto, sans-serif; overflow: hidden; }
+  #stage { position: fixed; inset: 0; }
+  #stage video, #stage canvas { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+  #stage canvas { image-rendering: pixelated; pointer-events: none; }
+  video.gray { filter: grayscale(1) contrast(1.15) brightness(.9); }
+  video.dark { opacity: 0; }
+
+  #hud { position: fixed; top: max(10px, env(safe-area-inset-top)); left: 12px; right: 12px;
+    display: flex; justify-content: space-between; align-items: flex-start; gap: 8px; pointer-events: none; }
+  .pill { background: var(--ui-bg); padding: 8px 12px; border-radius: 999px; font-weight: 700; font-size: 18px; }
+  #count.alert { background: var(--accent); color: #000; }
+  #frozen { display: none; background: #fff; color: #000; }
+
+  #readout { position: fixed; left: 50%; transform: translateX(-50%); top: 70px; background: var(--ui-bg);
+    padding: 10px 14px; border-radius: 12px; display: none; text-align: center; max-width: 90vw; }
+  #readout .sw { display: inline-block; width: 18px; height: 18px; border: 2px solid #fff; vertical-align: middle; margin-right: 6px; }
+  #readout b { font-size: 20px; }
+
+  #controls { position: fixed; left: 0; right: 0; bottom: 0; padding: 10px 12px max(12px, env(safe-area-inset-bottom));
+    background: linear-gradient(transparent, rgba(0,0,0,.85) 30%); }
+  .row { display: flex; gap: 8px; align-items: center; margin-top: 8px; }
+  .row label { white-space: nowrap; font-size: 14px; }
+  input[type=range] { flex: 1; accent-color: var(--accent); height: 32px; }
+  button { flex: 1; min-height: 48px; border: 2px solid #fff; background: var(--ui-bg); color: #fff;
+    border-radius: 12px; font: inherit; font-weight: 700; font-size: 15px; padding: 6px; }
+  button.on { background: var(--accent); color: #000; border-color: var(--accent); }
+
+  #start { position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center;
+    padding: 24px; text-align: center; background: #000; z-index: 10; }
+  #start h1 { margin: 0 0 8px; font-size: 28px; }
+  #start p { max-width: 420px; color: #ccc; }
+  #start button { flex: none; width: min(320px, 90vw); min-height: 60px; font-size: 20px; background: var(--accent); color: #000; border-color: var(--accent); }
+  #err { color: var(--accent); margin-top: 12px; }
+</style>
+</head>
+<body>
+
+<div id="start">
+  <h1>Blood Tracker</h1>
+  <p>Scans the camera for blood-red colours and shows them as <b style="color:var(--hit)">bright cyan</b> on a black-and-white image, so you don't have to tell red from green yourself.</p>
+  <p style="font-size:14px">Hold the phone 1–2 m above the ground and sweep slowly. Tap the screen to have it name the colour you tapped.</p>
+  <button id="go">Start camera</button>
+  <div id="err"></div>
+</div>
+
+<div id="stage">
+  <video id="video" class="gray" playsinline muted autoplay></video>
+  <canvas id="overlay"></canvas>
+</div>
+
+<div id="hud">
+  <div class="pill" id="count">0 spots</div>
+  <div class="pill" id="frozen">PAUSED</div>
+</div>
+<div id="readout"></div>
+
+<div id="controls">
+  <div class="row">
+    <label for="sens">Sensitivity</label>
+    <input id="sens" type="range" min="0" max="100" value="45">
+  </div>
+  <div class="row">
+    <button id="bView">View: Gray</button>
+    <button id="bDried">Dried: Off</button>
+    <button id="bColor">Mark: Cyan</button>
+  </div>
+  <div class="row">
+    <button id="bTorch">Light</button>
+    <button id="bFreeze">Pause</button>
+    <button id="bAlert" class="on">Beep: On</button>
+  </div>
+</div>
+
+<script>
+(() => {
+  'use strict';
+  const $ = id => document.getElementById(id);
+  const video = $('video'), overlay = $('overlay'), octx = overlay.getContext('2d');
+  const work = document.createElement('canvas');
+  const wctx = work.getContext('2d', { willReadFrequently: true });
+
+  const PROC_W = 480;               // processing width (px); higher = finds smaller drops, slower
+  const FRAME_MS = 70;              // ~14 fps processing
+
+  const settings = load({ sens: 45, view: 0, dried: false, color: 0, alert: true });
+  const VIEWS = ['Gray', 'Color', 'Mask'];
+  const COLORS = [ ['Cyan', [0,229,255]], ['Yellow', [255,230,0]], ['Blue', [40,120,255]], ['White', [255,255,255]] ];
+
+  let stream = null, track = null, torchOn = false, frozen = false;
+  let last = 0, lastImg = null, lastMask = null, W = 0, H = 0;
+  let audio = null, lastBeep = 0, prevCount = 0;
+
+  // ---------- settings persistence ----------
+  function load(def) {
+    try { return Object.assign(def, JSON.parse(localStorage.getItem('bt-settings') || '{}')); }
+    catch { return def; }
+  }
+  function save() { try { localStorage.setItem('bt-settings', JSON.stringify(settings)); } catch {} }
+
+  // ---------- colour math ----------
+  function hsv(r, g, b) {
+    const max = Math.max(r, g, b), min = Math.min(r, g, b), d = max - min;
+    let h = 0;
+    if (d) {
+      if (max === r) h = 60 * (((g - b) / d) % 6);
+      else if (max === g) h = 60 * ((b - r) / d + 2);
+      else h = 60 * ((r - g) / d + 4);
+      if (h < 0) h += 360;
+    }
+    return [h, max ? d / max : 0, max];
+  }
+
+  // Is this pixel blood-coloured?  s = sensitivity 0..1
+  function isBlood(r, g, b, s, dried) {
+    if (r < g || r < b) return false;           // red must dominate
+    const [h, sat, v] = hsv(r, g, b);
+    const hueMax = dried ? 18 + 6 * s : 12 + 8 * s;   // degrees past pure red toward orange
+    const hueMin = 345 - 12 * s;                      // degrees on the magenta side
+    if (h > hueMax && h < hueMin) return false;
+    const satMin = (dried ? 0.5 : 0.62) - 0.22 * s;
+    if (sat < satMin) return false;
+    const vMin = dried ? 30 : 75 - 35 * s;
+    if (v < vMin) return false;
+    if (v > 250 && sat < 0.75) return false;          // blown-out highlights
+    return true;
+  }
+
+  // Plain-language colour name for the tap readout
+  function colorName(r, g, b) {
+    const [h, s, v] = hsv(r, g, b);
+    if (v < 40) return 'very dark / black';
+    if (s < 0.15) return v > 200 ? 'white' : 'gray';
+    let n;
+    if (h < 12 || h >= 345) n = 'RED';
+    else if (h < 25) n = 'red-orange';
+    else if (h < 45) n = (v < 150 ? 'brown' : 'orange');
+    else if (h < 70) n = (v < 150 ? 'olive / khaki' : 'yellow');
+    else if (h < 160) n = 'GREEN';
+    else if (h < 200) n = 'teal';
+    else if (h < 260) n = 'blue';
+    else if (h < 300) n = 'purple';
+    else n = 'pink / magenta';
+    if (s < 0.35 && n !== 'RED') n = 'dull ' + n;
+    if (v < 90 && !/brown|black/.test(n)) n = 'dark ' + n;
+    return n;
+  }
+
+  // ---------- camera ----------
+  async function startCamera() {
+    if (!navigator.mediaDevices?.getUserMedia) throw new Error('This browser has no camera access. Open the page over https in Chrome or Safari.');
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: false,
+      video: { facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1080 } }
+    });
+    video.srcObject = stream;
+    await video.play();
+    track = stream.getVideoTracks()[0];
+    const caps = track.getCapabilities ? track.getCapabilities() : {};
+    if (!caps.torch) { $('bTorch').disabled = true; $('bTorch').textContent = 'No light'; $('bTorch').style.opacity = .4; }
+    try { // ask for continuous focus if supported
+      if (caps.focusMode?.includes('continuous')) await track.applyConstraints({ advanced: [{ focusMode: 'continuous' }] });
+    } catch {}
+  }
+
+  function sizeCanvases() {
+    const vw = video.videoWidth, vh = video.videoHeight;
+    if (!vw) return false;
+    W = PROC_W; H = Math.round(PROC_W * vh / vw);
+    if (work.width !== W || work.height !== H) {
+      work.width = overlay.width = W; work.height = overlay.height = H;
+    }
+    return true;
+  }
+
+  // ---------- processing ----------
+  function loop(t) {
+    requestAnimationFrame(loop);
+    if (t - last < FRAME_MS || !sizeCanvases()) return;
+    last = t;
+    if (!frozen || !lastImg) {
+      wctx.drawImage(video, 0, 0, W, H);
+      lastImg = wctx.getImageData(0, 0, W, H);
+    }
+    process(t);
+  }
+
+  function process(t) {
+    const d = lastImg.data, n = W * H, s = settings.sens / 100, dried = settings.dried;
+    const raw = new Uint8Array(n);
+    for (let i = 0, p = 0; i < n; i++, p += 4) raw[i] = isBlood(d[p], d[p + 1], d[p + 2], s, dried) ? 1 : 0;
+
+    // Speckle filter: keep a pixel only if at least 2 of its 8 neighbours also match.
+    const mask = new Uint8Array(n);
+    for (let y = 1; y < H - 1; y++) for (let x = 1; x < W - 1; x++) {
+      const i = y * W + x; if (!raw[i]) continue;
+      const c = raw[i-W-1] + raw[i-W] + raw[i-W+1] + raw[i-1] + raw[i+1] + raw[i+W-1] + raw[i+W] + raw[i+W+1];
+      if (c >= 2) mask[i] = 1;
+    }
+    lastMask = mask;
+
+    // Group into spots (connected components)
+    const seen = new Uint8Array(n), stack = new Int32Array(n), blobs = [];
+    for (let i = 0; i < n; i++) {
+      if (!mask[i] || seen[i]) continue;
+      let sp = 0, size = 0, x0 = W, y0 = H, x1 = 0, y1 = 0;
+      stack[sp++] = i; seen[i] = 1;
+      while (sp) {
+        const j = stack[--sp], x = j % W, y = (j / W) | 0; size++;
+        if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y;
+        const nb = [j - 1, j + 1, j - W, j + W];
+        for (const k of nb) if (k >= 0 && k < n && mask[k] && !seen[k] && Math.abs((k % W) - x) <= 1) { seen[k] = 1; stack[sp++] = k; }
+      }
+      if (size >= 3) blobs.push({ x0, y0, x1, y1, size });
+    }
+    // Only count spots inside the part of the frame actually visible on screen (object-fit: cover crops it)
+    const sw = innerWidth, sh = innerHeight, sc = Math.max(sw / W, sh / H);
+    const vx0 = (W - sw / sc) / 2, vy0 = (H - sh / sc) / 2;
+    const visible = blobs.filter(b => b.x1 >= vx0 && b.x0 <= W - vx0 && b.y1 >= vy0 && b.y0 <= H - vy0);
+    blobs.sort((a, b) => b.size - a.size);
+
+    draw(mask, blobs, t);
+    report(visible.length, t);
+  }
+
+  function draw(mask, blobs, t) {
+    const [cr, cg, cb] = COLORS[settings.color][1];
+    const view = settings.view;
+    const pulse = 0.55 + 0.45 * Math.sin(t / 140);         // blink so even tiny hits catch the eye
+    const out = octx.createImageData(W, H), o = out.data;
+    for (let i = 0, p = 0; i < mask.length; i++, p += 4) {
+      if (mask[i]) { o[p] = cr; o[p+1] = cg; o[p+2] = cb; o[p+3] = 255 * pulse; }
+      else if (view === 2) { o[p+3] = 255; }               // Mask view: black background
+    }
+    octx.putImageData(out, 0, 0);
+
+    // Rings around spots, padded so single drops are obvious
+    octx.lineWidth = Math.max(2, W / 200);
+    octx.strokeStyle = `rgba(${cr},${cg},${cb},${0.4 + 0.6 * pulse})`;
+    for (const b of blobs.slice(0, 40)) {
+      const pad = 6, cx = (b.x0 + b.x1) / 2, cy = (b.y0 + b.y1) / 2;
+      const r = Math.max(b.x1 - b.x0, b.y1 - b.y0) / 2 + pad;
+      octx.beginPath(); octx.arc(cx, cy, r, 0, Math.PI * 2); octx.stroke();
+    }
+  }
+
+  function report(count, t) {
+    const el = $('count');
+    el.textContent = count === 1 ? '1 spot' : `${count} spots`;
+    el.classList.toggle('alert', count > 0);
+    if (count > 0 && prevCount === 0 && settings.alert && !frozen && t - lastBeep > 1500) {
+      lastBeep = t; beep();
+      if (navigator.vibrate) navigator.vibrate(120);
+    }
+    prevCount = count;
+  }
+
+  function beep() {
+    try {
+      audio = audio || new (window.AudioContext || window.webkitAudioContext)();
+      const o = audio.createOscillator(), g = audio.createGain();
+      o.frequency.value = 1400; g.gain.value = 0.15;
+      o.connect(g).connect(audio.destination);
+      o.start(); o.stop(audio.currentTime + 0.09);
+    } catch {}
+  }
+
+  // ---------- tap to identify colour ----------
+  let readoutTimer = 0;
+  $('stage').addEventListener('click', e => {
+    if (!lastImg) return;
+    // map screen point -> processing pixel, accounting for object-fit: cover
+    const rect = $('stage').getBoundingClientRect();
+    const scale = Math.max(rect.width / W, rect.height / H);
+    const offX = (rect.width - W * scale) / 2, offY = (rect.height - H * scale) / 2;
+    const px = Math.round((e.clientX - rect.left - offX) / scale), py = Math.round((e.clientY - rect.top - offY) / scale);
+    if (px < 1 || py < 1 || px >= W - 1 || py >= H - 1) return;
+    // average a 3x3 patch
+    let r = 0, g = 0, b = 0;
+    for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+      const p = ((py + dy) * W + px + dx) * 4; r += lastImg.data[p]; g += lastImg.data[p+1]; b += lastImg.data[p+2];
+    }
+    r = Math.round(r / 9); g = Math.round(g / 9); b = Math.round(b / 9);
+    const blood = isBlood(r, g, b, settings.sens / 100, settings.dried);
+    const ro = $('readout');
+    ro.innerHTML = `<span class="sw" style="background:rgb(${r},${g},${b})"></span><b>${colorName(r, g, b)}</b><br>` +
+      (blood ? '<span style="color:var(--accent)">Matches blood colour</span>' : 'Not a blood match');
+    ro.style.display = 'block';
+    clearTimeout(readoutTimer); readoutTimer = setTimeout(() => ro.style.display = 'none', 3500);
+  });
+
+  // ---------- controls ----------
+  function applyUI() {
+    $('sens').value = settings.sens;
+    $('bView').textContent = 'View: ' + VIEWS[settings.view];
+    video.className = settings.view === 0 ? 'gray' : settings.view === 2 ? 'dark' : '';
+    $('bDried').textContent = 'Dried: ' + (settings.dried ? 'On' : 'Off');
+    $('bDried').classList.toggle('on', settings.dried);
+    $('bColor').textContent = 'Mark: ' + COLORS[settings.color][0];
+    const [r, g, b] = COLORS[settings.color][1];
+    document.documentElement.style.setProperty('--hit', `rgb(${r},${g},${b})`);
+    $('bAlert').textContent = 'Beep: ' + (settings.alert ? 'On' : 'Off');
+    $('bAlert').classList.toggle('on', settings.alert);
+    save();
+  }
+  $('sens').addEventListener('input', e => { settings.sens = +e.target.value; save(); });
+  $('bView').onclick = () => { settings.view = (settings.view + 1) % VIEWS.length; applyUI(); };
+  $('bDried').onclick = () => { settings.dried = !settings.dried; applyUI(); };
+  $('bColor').onclick = () => { settings.color = (settings.color + 1) % COLORS.length; applyUI(); };
+  $('bAlert').onclick = () => { settings.alert = !settings.alert; applyUI(); if (settings.alert) beep(); };
+  $('bFreeze').onclick = () => {
+    frozen = !frozen;
+    frozen ? video.pause() : video.play();
+    $('bFreeze').textContent = frozen ? 'Resume' : 'Pause';
+    $('bFreeze').classList.toggle('on', frozen);
+    $('frozen').style.display = frozen ? 'block' : 'none';
+  };
+  $('bTorch').onclick = async () => {
+    if (!track) return;
+    try {
+      torchOn = !torchOn;
+      await track.applyConstraints({ advanced: [{ torch: torchOn }] });
+      $('bTorch').classList.toggle('on', torchOn);
+    } catch { torchOn = false; }
+  };
+
+  $('go').onclick = async () => {
+    $('err').textContent = '';
+    try {
+      beep(); // unlock audio on iOS with the user gesture
+      await startCamera();
+      $('start').style.display = 'none';
+      requestAnimationFrame(loop);
+    } catch (e) {
+      $('err').textContent = (e && e.name === 'NotAllowedError')
+        ? 'Camera permission was denied. Allow camera access for this site in your browser settings, then try again.'
+        : (e.message || String(e));
+    }
+  };
+
+  applyUI();
+  if ('serviceWorker' in navigator && location.protocol === 'https:') {
+    navigator.serviceWorker.register('sw.js').catch(() => {});
+  }
+})();
+</script>
+</body>
+</html>
